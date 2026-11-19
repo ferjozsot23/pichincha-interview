@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Onboarding agent as a container-image Lambda with a public Function URL.
+  Deployed by CI on every push to main (new ImageUri = new function code).
+
+Parameters:
+  ServiceName:
+    Type: String
+    Default: onboarding-agent
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI, tagged with the commit SHA
+
+Resources:
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref ServiceName
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ImageUri
+      Role: {"Fn::ImportValue": !Sub "${ServiceName}-ExecutionRoleArn"}
+      Architectures: [x86_64]
+      MemorySize: 1024
+      Timeout: 60  # a full case is ~4 s; leaves room for Bedrock retries
+      Environment:
+        Variables:
+          LLM_PROVIDER: bedrock
+          LLM_MODEL_ID: {"Fn::ImportValue": !Sub "${ServiceName}-ModelId"}
+
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt Function.Arn
+      AuthType: NONE
+
+  # Public access is allowed only through the Function URL, not the Invoke API.
+  PublicUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  PublicUrlFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  ServiceUrl:
+    Value: !GetAtt FunctionUrl.FunctionUrl

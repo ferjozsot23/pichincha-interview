@@ -1,0 +1,73 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  SERVICE_NAME: onboarding-agent
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - run: uv run pytest -q
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # GitHub OIDC -> AWS, no stored keys
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - id: image
+        name: Build and push image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
+        run: |
+          # Lambda rejects image indexes with attestations, so publish a plain image manifest.
+          docker build --platform linux/amd64 --provenance=false -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Lambda function
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$SERVICE_NAME-service" \
+            --template-file infra/service.yaml \
+            --parameter-overrides ServiceName="$SERVICE_NAME" ImageUri="${{ steps.image.outputs.uri }}" \
+            --no-fail-on-empty-changeset
+
+      - name: Smoke test public endpoint
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name "$SERVICE_NAME-service" \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceUrl'].OutputValue" --output text)
+          URL="${URL%/}"
+          echo "Service URL: $URL" >> "$GITHUB_STEP_SUMMARY"
+          curl --fail --silent --retry 10 --retry-delay 10 --retry-all-errors "$URL/health"
+          curl --fail --silent -X POST "$URL/api/v1/onboarding/start" \
+            -H 'Content-Type: application/json' \
+            -d '{"prospect_name": "Juan Perez", "document_id": "1712345675", "product": "cuenta_ahorros"}' \
+            | jq -e '.eligibility.verdict == "apto"'
